@@ -241,6 +241,75 @@ macro_rules! generate_arbitrary {
             unsafe { core_path::str::from_utf8_unchecked(&storage[..valid_len]) }
         }
 
+        /// Generate a `CharArraySearcher<'_, M>` (the associated searcher for `[char; M]` as a
+        /// `Pattern`) over the haystack `any_str_ref` produces from `storage`, a nondeterministic
+        /// byte array (at most `N` bytes) that the caller keeps alive for as long as the returned
+        /// searcher is in use, searching for a nondeterministic array of `M` needle chars.
+        ///
+        /// This model is used by the compiler to generate nondeterministic
+        /// `CharArraySearcher<'_, M>` arguments for automatic harnesses (`kani autoharness`).
+        /// Note that any verification result obtained with a bounded value like this one is
+        /// valid only up to the bound.
+        #[kanitool::fn_marker = "AnyCharArraySearcherModel"]
+        #[inline(never)]
+        #[doc(hidden)]
+        pub fn any_char_array_searcher<const N: usize, const M: usize>(
+            storage: &mut [u8; N],
+        ) -> core_path::str::pattern::CharArraySearcher<'_, M> {
+            let haystack = crate::kani::any_str_ref(storage);
+            let needle: [char; M] = crate::kani::any();
+            core_path::str::pattern::Pattern::into_searcher(needle, haystack)
+        }
+
+        /// Generate a `CharArrayRefSearcher<'a, 'b, M>` (the associated searcher for
+        /// `&'b [char; M]` as a `Pattern`) over the haystack `any_str_ref` produces from
+        /// `storage`, a nondeterministic byte array (at most `N` bytes), searching for a
+        /// nondeterministic array of `M` needle chars written into `needle_storage`. Unlike
+        /// `any_char_array_searcher`, the needle is borrowed rather than owned by the searcher,
+        /// so the caller supplies its own storage for it (`needle_storage`) and keeps both
+        /// `storage` and `needle_storage` alive for as long as the returned searcher is in use.
+        ///
+        /// This model is used by the compiler to generate nondeterministic
+        /// `CharArrayRefSearcher<'a, 'b, M>` arguments for automatic harnesses (`kani
+        /// autoharness`). Note that any verification result obtained with a bounded value like
+        /// this one is valid only up to the bound.
+        #[kanitool::fn_marker = "AnyCharArrayRefSearcherModel"]
+        #[inline(never)]
+        #[doc(hidden)]
+        pub fn any_char_array_ref_searcher<'a, 'b, const N: usize, const M: usize>(
+            storage: &'a mut [u8; N],
+            needle_storage: &'b mut [char; M],
+        ) -> core_path::str::pattern::CharArrayRefSearcher<'a, 'b, M> {
+            let haystack = crate::kani::any_str_ref(storage);
+            *needle_storage = crate::kani::any();
+            core_path::str::pattern::Pattern::into_searcher(&*needle_storage, haystack)
+        }
+
+        /// Generate a `CharSliceSearcher<'a, 'b>` (the associated searcher for `&'b [char]` as a
+        /// `Pattern`) over the haystack `any_str_ref` produces from `storage`, a nondeterministic
+        /// byte array (at most `N` bytes), searching for a nondeterministic-length prefix (`0..=M`
+        /// chars) of a nondeterministic array of `M` chars written into `needle_storage`. As with
+        /// `any_char_array_ref_searcher`, the caller supplies `needle_storage` and keeps both it
+        /// and `storage` alive for as long as the returned searcher is in use.
+        ///
+        /// This model is used by the compiler to generate nondeterministic
+        /// `CharSliceSearcher<'a, 'b>` arguments for automatic harnesses (`kani autoharness`).
+        /// Note that any verification result obtained with a bounded value like this one is
+        /// valid only up to the bound.
+        #[kanitool::fn_marker = "AnyCharSliceSearcherModel"]
+        #[inline(never)]
+        #[doc(hidden)]
+        pub fn any_char_slice_searcher<'a, 'b, const N: usize, const M: usize>(
+            storage: &'a mut [u8; N],
+            needle_storage: &'b mut [char; M],
+        ) -> core_path::str::pattern::CharSliceSearcher<'a, 'b> {
+            let haystack = crate::kani::any_str_ref(storage);
+            *needle_storage = crate::kani::any();
+            let len: usize = crate::kani::any();
+            crate::kani::assume(len <= M);
+            core_path::str::pattern::Pattern::into_searcher(&needle_storage[..len], haystack)
+        }
+
         arbitrary_tuple!(A);
         arbitrary_tuple!(A, B);
         arbitrary_tuple!(A, B, C);
