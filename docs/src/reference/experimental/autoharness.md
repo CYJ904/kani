@@ -9,7 +9,7 @@ This harness first declares a local variable `x` using `kani::any()`, then calls
 Many proof harnesses follow this predictable format—to verify a function `foo`, we create arbitrary values for each of `foo`'s arguments, then call `foo` on those arguments.
 
 The `autoharness` subcommand leverages this observation to automatically generate harnesses and run Kani against them.
-Kani scans the crate for functions whose arguments all implement the `kani::Arbitrary` trait, generates harnesses for them, then runs them.
+Kani scans the crate for functions whose arguments it can generate nondeterministically (see [Generating harnesses](#generating-harnesses)), generates harnesses for them, then runs them.
 These harnesses are internal to Kani—i.e., Kani does not make any changes to your source code.
 
 ## Usage
@@ -22,7 +22,7 @@ or
 # kani autoharness -Z autoharness <FILE>
 ```
 
-If Kani detects that all of a function `foo`'s arguments implement `kani::Arbitrary`, it will generate and run a `#[kani::proof]` harness, which prints:
+If Kani can generate all of a function `foo`'s arguments, it will generate and run a `#[kani::proof]` harness, which prints:
 
 ```
 Autoharness: Checking function foo against all possible inputs...
@@ -44,7 +44,26 @@ Kani generates and runs these harnesses internally—the user only sees the veri
 
 For a full list of options, run `kani autoharness --help`.
 
-<!-- TODO(#4979 item 8): document --std -->
+To run autoharness on the Rust standard library itself, pass `--std` to the standalone
+command and point it at the `library` directory of a standard library checkout, such as the
+one in [verify-rust-std](https://github.com/model-checking/verify-rust-std):
+
+```
+# kani autoharness -Z autoharness --std <PATH>/library
+```
+
+The path must be a directory named `library`. Kani builds it with `cargo -Z build-std` through
+a temporary crate in the target directory, as `kani verify-std` does. `--std` is only available
+on `kani autoharness`, not on `cargo kani autoharness`.
+
+When verifying the standard library, only the Kani definitions available to `core` can be
+used. The argument models that need `alloc` (`Box`, `Rc` and `Arc` arguments, unbounded
+primitive slices and `Vec`s, and the closure models for `Fn`-bound type parameters) are
+therefore not available with `--std`. Affected arguments are generated with bounded values
+where `core` provides a bounded generator and `--bounded-arguments` is passed; otherwise the
+function is skipped.
+
+Concrete playback (`-Z concrete-playback`) is not supported by the `autoharness` subcommand.
 
 ## Example
 Using the `estimate_size` example from [First Steps](../../tutorial-first-steps.md) again:
@@ -70,10 +89,14 @@ Complete - 0 successfully verified functions, 1 failures, 1 total.
 
 ## Selecting functions
 
-### Include and exclude patterns
-The `autoharness` subcommand has options `--include-pattern [REGEX]` and `--exclude-pattern [REGEX]` to include and exclude particular functions using regular expressions.
-When matching, Kani prefixes the function's path with the crate name. For example, a function `foo` in the `my_crate` crate will be matched as `my_crate::foo`.
+Autoharness considers functions defined in the crate being verified, including free functions, inherent methods, trait-implementation methods, and trait methods with default implementations. Functions from dependencies are not candidates. For each eligible function, Kani selects one automatic harness; functions that fail a selection check are skipped. Kani reports selected functions and visible skip reasons before verification, unless `--quiet` is specified.
 
+Selection first attempts to instantiate generic functions, then applies the include and exclude patterns, and finally checks whether the function's arguments can be generated. The details of argument generation are described in [Generating harnesses](#generating-harnesses).
+
+### Include and exclude patterns
+
+The `autoharness` subcommand has options `--include-pattern [REGEX]` and `--exclude-pattern [REGEX]` to include and exclude particular functions using regular expressions.
+When matching, Kani prefixes the function's path with the crate name. For example, a non-generic function `foo` in the `my_crate` crate is matched as `my_crate::foo`.
 The selection algorithm is as follows:
 - If only `--include-pattern`s are provided, include a function if it matches any of the provided patterns.
 - If only `--exclude-pattern`s are provided, include a function if it does not match any of the provided patterns.
@@ -103,26 +126,60 @@ Note that because Kani prefixes function paths with the crate name, some pattern
 For example, given a function `foo_top_level` inside crate `my_crate`, the regex `.*::foo_.*` will match `foo_top_level`, since Kani interprets it as `my_crate::foo_top_level`.
 To match only `foo_` functions inside modules, use a more specific pattern, e.g. `.*::[^:]+::foo_.*`.
 
-### Listing functions (--list)
-Autoharness also accepts a `--list` argument, which runs the [list subcommand](../list.md) including automatic harnesses.
+Patterns match the **instantiated name** of a generic function. For example, `my_crate::foo::<i32>` does not match `^my_crate::foo$`, although an unanchored `foo` pattern matches it. Regular expressions are unanchored unless explicitly anchored; invalid expressions and patterns containing whitespace are rejected. Kani also warns if an include-pattern string contains an exclude-pattern string.
 
-<!-- TODO(#4979 item 8): document --format -->
+Generic instantiation happens before include/exclude filtering. Consequently, a generic function for which Kani cannot find an instantiation is reported with the `Generic Function` skip reason even if the function would not match the supplied filters.
+
+### Listing functions (--list)
+
+Autoharness also accepts `--list`, which compiles the project and runs the [list subcommand](../list.md), including automatic harnesses, **without running verification**. Unless `--quiet` is passed, Kani first prints the selected-functions and skipped-functions tables.
+
+Use `--list --format <FORMAT>` to choose the output format:
+
+| Format | Output |
+| --- | --- |
+| `pretty` (default) | Print the list to the terminal. |
+| `markdown` | Write `kani-list.md` in the current directory. |
+| `json` | Write `kani-list.json` in the current directory. |
+
+For file-based formats, Kani prints the path of the written file. The `--format` option requires `--list`. Combining `--quiet` with `--list --format pretty` is not supported.
+
+For example:
+
+```bash
+# List functions and harnesses without verification
+cargo kani autoharness -Z autoharness --list
+
+# Write the list as JSON
+cargo kani autoharness -Z autoharness --list --format json
+```
 
 ### Skip reasons
 
-<!-- TODO(#4979 item 6): list the skip reasons -->
+Autoharness records one skip reason per skipped function: the first failed check in its selection process. The skipped-functions table has `Crate`, `Skipped Function`, and `Reason for Skipping` columns. Reasons visible to users include:
+
+| Reason shown | Meaning |
+| --- | --- |
+| `Can only be called at compile time` | The function is marked for compile-time execution and cannot be selected for an automatic harness. |
+| `Generic Function: <detail>` | Kani could not find a supported instantiation satisfying the function's constraints. The detail provides the specific cause; see [Generic Functions](#generic-functions). |
+| `The function does not have a body` | There is no function body available to verify, as with a trait method without a default implementation. |
+| `Did not match provided filters` | The function was excluded by the include/exclude patterns. |
+| `Unsupported variadic calling convention` | The function is a C-variadic function whose calling convention Kani cannot model (for example, `extern "sysv64"`). |
+| `Missing Arbitrary implementation for argument(s) x: T, y: U` | At least one argument cannot be generated using a supported argument model. The argument names and types depend on the function. |
+| `Requires --bounded-arguments for argument(s) x: T` | At least one argument requires opting into bounded generation. The argument names and types depend on the function. |
+
+Missing argument names are displayed as `_`. If a function has both unsupported arguments and arguments requiring bounded generation, `Missing Arbitrary implementation` is the skip reason reported. See [Generating harnesses](#generating-harnesses) for the supported argument models and [Bounded Arguments](#bounded-arguments-opt-in---bounded-arguments) for the opt-in behavior.
+
+Kani's internal implementation functions and functions already used as proof harnesses may be excluded internally with the `Kani implementation` reason, but these entries are **not displayed** in the skipped-functions table. The selected-functions table contains `Crate` and `Selected Function` columns. Where a generic instantiation is chosen, the tables display the instantiated function name (for example, `foo::<i32>`); a generic function that cannot be instantiated is listed under its uninstantiated name.
 
 ### Generic Functions
-For a generic function, Kani generates a harness for a single monomorphic instantiation of the function:
-it substitutes the function's type parameters with concrete types such that all of the function's
-trait bounds are satisfied, and erases lifetime parameters. Kani first tries a fixed list of
-primitive types (starting with `i32`, and including the wider integer and float types) uniformly
-for all parameters; if that fails, it searches per-parameter combinations, drawing additional
-candidate types from the concrete implementations of the traits each parameter is bound by
-(so, e.g., a parameter bound by a crate-local trait can be instantiated with a crate-local struct
-implementing it). The search is capped, so functions with many type parameters or very complex
-bounds may still be skipped.
+
+For a generic function, Kani generates a harness for a **single monomorphic instantiation**: it substitutes concrete types for the function's type parameters, requires the instantiation to satisfy the trait bounds and `where` clauses, and erases lifetime parameters.
+
+Kani first tries the following primitive candidate types, using the same type for each type parameter: `i32`, `u32`, `usize`, `u8`, `i64`, `u64`, `f64`, `f32`, `bool`, and `char`. If no uniform choice works, it searches combinations of candidate types for individual parameters. Alongside the primitives, the candidates can include up to 16 concrete types derived from implementations of the parameter's trait bounds (for example, a crate-local struct implementing a crate-local trait). This combinatorial search is limited to 256 attempts. If it finds no suitable instantiation, Kani makes one final attempt using `()` for every type parameter.
+
 For example, given:
+
 ```rust
 fn foo<T: Eq>(x: T, y: T) {
     if x == y {
@@ -130,28 +187,25 @@ fn foo<T: Eq>(x: T, y: T) {
     }
 }
 ```
-Kani generates and runs a harness that verifies `foo::<i32>`, and the summary table shows the
-instantiated name, e.g.:
-```
+
+Kani generates and runs a harness that verifies `foo::<i32>`, and the summary table shows the instantiated name, e.g.:
+
+```text
 | Crate    | Selected Function | Kind of Automatic Harness | Verification Result |
 | my_crate | foo::<i32>        | #[kani::proof]            | Failure             |
 ```
-Verifying a single instantiation is an underapproximation of all of the function's possible behaviors:
-a successful result for `foo::<i32>` does not imply that other instantiations of `foo` are also safe.
-Kani makes this explicit by displaying the instantiated name of the verified function.
 
-`usize` const generic parameters (e.g. array lengths) are instantiated with the value 2.
+Verifying a single instantiation is an underapproximation of all of the function's possible behaviors: a successful result for `foo::<i32>` does not imply that other instantiations of `foo` are also safe. Kani makes the chosen instantiation explicit by displaying its name. See [Single monomorphization](#single-monomorphization) for the implications of this limitation.
 
-Kani skips a generic function (with skip reason "Generic Function") if:
-- no candidate type satisfies the function's trait bounds, or
-- the function has non-`usize` const generic parameters, which Kani does not instantiate yet.
+**Const generic parameters.** `usize` const generic parameters, such as array lengths, are instantiated with the value `2`, so an instantiated function name might include `::<2>`. Other const-generic parameter types are currently unsupported. Kani also skips a function if its const-generic parameter can reach a `const {}` block whose evaluation may constrain that parameter (for example, `const { assert!(N >= 4) }`). This check is conservative: Kani may skip a function even if the substituted value would satisfy the assertion, rather than risk an invalid compile-time evaluation.
 
-If some caller of a generic function is eligible for an automatic harness, then additional monomorphized
-versions of the generic function may still be reachable (and thus verified) through the caller's harness.
+**Function-trait bounds.** For parameters bounded by `Fn`, `FnMut`, or `FnOnce`, Kani can try nondeterministic function models instead of skipping the generic function. The models support zero to three by-value inputs, or one to two inputs involving shared references (including mixed reference/value arguments). The return type must implement `Arbitrary`. Models can also be selected for signatures that involve the generic function's other type parameters, when the resulting bounds can be satisfied. If no available model is suitable, the function may be skipped as a generic function. See [Fn-bound closures](#fn-bound-closures) for the model's behavior and limitations.
 
-<!-- TODO(#4979 item 2): generic functions with Fn bounds -->
+**Other instantiation failures.** Kani may skip a generic function when no candidate satisfies its bounds or the instantiation search reaches its limit. It also rejects candidate instantiations that would call a `simd_*` intrinsic in the function's own body with incompatible non-SIMD types or an invalid SIMD comparison-result type; another valid candidate may still be selected. The `Generic Function` skip-reason detail identifies applicable failures, including unsupported const generics, const-generic preconditions, SIMD constraints, exhausted search attempts, or unsatisfied trait bounds.
 
-<!-- TODO(#4979 item 7): SIMD and const generic instantiation -->
+If some caller of a generic function is eligible for an automatic harness, then additional monomorphized versions of the generic function may still be reachable (and thus verified) through the caller's harness.
+
+After Kani selects a function and, when necessary, an instantiation, it generates the harness arguments as described in [Generating harnesses](#generating-harnesses).
 
 ## Generating harnesses
 
@@ -254,7 +308,8 @@ see [Generic Functions](#generic-functions).
 These models check the function under verification against arbitrary callback results.
 They do not execute a particular closure's body or model its captures, mutations or other
 side effects. Use a handwritten harness when verification depends on a particular callback
-implementation.
+implementation. See [Other limitations](#other-limitations) for what this means for a
+`Success` result, and [#4994](https://github.com/model-checking/kani/issues/4994).
 
 ##### Formatting Trait Implementations
 For the `fmt` methods of `Debug`, `Display`, `Binary`, `Octal`, `LowerHex`, `UpperHex`, `LowerExp`,
@@ -456,11 +511,56 @@ results arrive in nondeterministic order; the summary table printed at the end i
 
 ### Default settings
 
-<!-- TODO(#4979 item 5): default settings -->
+Unless you pass them yourself, `kani autoharness` sets two verification options so that a
+single harness cannot hold up the whole run:
+
+- `--harness-timeout 60s`: a harness whose verification takes longer than 60 seconds is
+  stopped and reported as a failure.
+- `--default-unwind 20`: loops are unwound up to 20 times. Automatic harnesses carry no
+  `#[kani::unwind]` attribute, so this bound applies to every loop unless you pass
+  `--unwind`. Kani's unwinding checks stay enabled, so a loop that needs more iterations fails
+  an unwinding assertion instead of being silently cut short.
+
+To change either value, pass the option explicitly. When any automatic harness fails, Kani
+prints a reminder of these two defaults after the summary table, because the failure may come
+from a timeout or an insufficient unwinding bound rather than from a bug in the function. In
+that case, try larger values or, where possible, add a [loop contract](./loop-contracts.md).
+The default bounds for [bounded arguments](#bounded-arguments-opt-in---bounded-arguments) are
+chosen to stay below the unwinding bound, and Kani warns if a configured bound reaches it.
+
+Verification itself runs in parallel by default; see
+[Parallel verification](#parallel-verification).
 
 ### Summary table and markers
 
-<!-- TODO(#4979): (bounded) / (ctor) markers, bounds note -->
+A run of `kani autoharness` prints its results in three stages:
+
+1. Before verification, unless `--quiet` is passed, the tables of selected and skipped
+   functions (see [Skip reasons](#skip-reasons)).
+2. During verification, the result of each harness as it finishes.
+3. After verification, the `Autoharness Summary` table, followed by a line of the form
+   `Complete - N successfully verified functions, M failures, T total.` If the crate also
+   contains manual harnesses, they are verified in the same run and reported separately in a
+   `Manual Harness Summary`.
+
+The summary table has the columns `Crate`, `Selected Function`, `Kind of Automatic Harness`
+and `Verification Result`. Rows are sorted by function name, with successes listed before
+failures. For a generic function, `Selected Function` shows the verified instantiation, e.g.
+`foo::<i32>`. `Kind of Automatic Harness` is `#[kani::proof]`, or
+`#[kani::proof_for_contract]` when the function has a [function contract](contracts.md), and
+may carry one or both of these markers:
+
+- **"(bounded)"**: some arguments were generated with bounded values under
+  `--bounded-arguments`. A note after the table lists the bounds the run used (slice length,
+  string length, and the `BoundedArbitrary` bound) and repeats that the result only holds up
+  to them.
+- **"(ctor)"**: some values were generated through one of a type's own constructors, or
+  constrained by mined invariants, under
+  [`--constructor-args`](#constructor-based-generation-constructor-args). A note after the
+  table repeats that the result only covers values reachable through that constructor.
+
+A `Success` without either marker still has the limitations described in
+[Soundness caveats](#soundness-caveats).
 
 ## Soundness caveats
 
@@ -550,7 +650,69 @@ harnesses they affect:
 
 ## Architecture (for contributors)
 
-<!-- TODO(#4979): architecture overview for contributors -->
+This section is for contributors who want to change how autoharness works. The work is split
+between the driver (`kani-driver`), which handles the command line and runs verification, and
+the compiler (`kani-compiler`), which selects functions and builds the harnesses while it
+compiles the crate:
+
+```text
+┌──────────────────────────── kani-driver ────────────────────────────┐
+│ args/autoharness_args.rs   CLI: --include/--exclude-pattern,        │
+│                            --bounded-arguments, --constructor-args, │
+│                            --check-invariants, --list, bounds       │
+│ autoharness/mod.rs  setup_session(): parallel defaults, timeout,    │
+│                     unwind, add_auto_harness_args() →               │
+│                     --autoharness-* compiler flags                  │
+│ call_single_file.rs: adds those flags to the kani-compiler call     │
+└────────────────┬────────────────────────────────────────────────────┘
+                 ▼
+┌──────────────────────────── kani-compiler ──────────────────────────┐
+│ kani_middle/codegen_units.rs                                        │
+│   automatic_harness_partition()  → chosen / skipped (+reasons)      │
+│   get_all_automatic_harnesses()  → AutomaticHarnessIntrinsic::<fn>  │
+│                                    + gen_automatic_proof_metadata() │
+│ kani_middle/transform/automatic.rs                                  │
+│   AutomaticHarnessPass    dummy body → [contract init] args = any() │
+│                           [assume invariants] f(args) [checks]      │
+│   AutomaticArbitraryPass  T::any() for derivable types              │
+│ codegen_cprover_gotoc → goto; KaniMetadata { autoharness_md, ... }  │
+└────────────────┬────────────────────────────────────────────────────┘
+                 ▼
+┌──────────────────────────── kani-driver ────────────────────────────┐
+│ postprocess_project(): chosen/skipped tables, --list stops here     │
+│ harness_runner.rs: CBMC per harness → print_autoharness_summary()   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+1. **Options and session setup** (`kani-driver`). `args/autoharness_args.rs` defines and
+   validates the `autoharness` options. `setup_session` in `autoharness/mod.rs` enables function
+   and loop contracts, applies the [parallel verification](#parallel-verification) defaults and
+   the [default timeout and unwinding bound](#default-settings), and `add_auto_harness_args`
+   turns the autoharness options into `--autoharness-*` flags, which the driver passes to
+   `kani-compiler` (see `call_single_file.rs`).
+2. **Selection** (`kani-compiler`, `kani_middle/codegen_units.rs`).
+   `automatic_harness_partition` decides for every function in the crate whether it gets a
+   harness, choosing an instantiation for generic functions and otherwise recording one of the
+   [skip reasons](#skip-reasons). It also records whether a harness will use bounded or
+   constructor-based values; these become the "(bounded)" and "(ctor)"
+   [markers](#summary-table-and-markers). For each selected function,
+   `get_all_automatic_harnesses` creates an instance of the `automatic_harness` intrinsic in
+   `kani_core` (marked `AutomaticHarnessIntrinsic`), whose body is still a placeholder, and
+   generates its metadata with `gen_automatic_proof_metadata`.
+3. **Harness bodies** (`kani-compiler`, `kani_middle/transform/automatic.rs`).
+   `AutomaticHarnessPass` replaces each placeholder body with the actual harness: it sets up
+   contract instrumentation if the function has a contract, generates each argument as
+   described in [Generating harnesses](#generating-harnesses), assumes the applicable
+   [assumptions](#assumptions), calls the function, and adds the [checks](#checks).
+   `AutomaticArbitraryPass` synthesizes `T::any()` for structs and enums that can derive
+   `Arbitrary` automatically.
+4. **Code generation**. `codegen_cprover_gotoc` translates the crate, including the harnesses,
+   into a goto program for CBMC, and the selected and skipped functions are stored in the
+   `autoharness_md` field of the crate's `KaniMetadata`.
+5. **Results** (`kani-driver`). `postprocess_project` in `autoharness/mod.rs` prints the
+   selected and skipped tables; with `--list`, the run stops here. Otherwise
+   `harness_runner.rs` runs CBMC on each harness and then calls `print_autoharness_summary` to
+   print the [summary table](#summary-table-and-markers).
 
 ## Request for comments
 This feature is experimental and is therefore subject to change.
