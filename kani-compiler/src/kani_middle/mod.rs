@@ -1184,6 +1184,18 @@ fn fmt_impl_self_ty(tcx: TyCtxt, instance: Instance) -> Option<(FmtTrait, Ty)> {
     let TyKind::RigidTy(RigidTy::Ref(_, self_ty, _)) = sig.inputs().first()?.kind() else {
         return None;
     };
+
+    // The `core::str::pattern` searcher types (`multi_char_eq_searcher_kind`) are supported in
+    // argument position only: their values are bounded and need storage that the harness owns,
+    // and they neither implement nor can derive `Arbitrary`, which the formatting models
+    // require of the self type. Bail out so that their `fmt` methods are handled as ordinary
+    // functions, with both arguments generated through the bounded argument path.
+    if let TyKind::RigidTy(RigidTy::Adt(def, _)) = self_ty.kind()
+        && multi_char_eq_searcher_kind(tcx, def).is_some()
+    {
+        return None;
+    }
+
     Some((fmt_trait, self_ty))
 }
 
